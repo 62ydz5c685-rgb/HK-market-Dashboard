@@ -4,9 +4,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
-st.set_page_config(page_title="港股量化系統：息率階梯 ＋ 千億 VCP 雷達", page_icon="📈", layout="wide")
+st.set_page_config(page_title="港股量化雙核系統 (O'Neil 大市時機版)", page_icon="📈", layout="wide")
 
-# 82 隻市值 1,000 億以上核心港股名單及中文對照
+# 82 隻千億市值核心港股
 HK_STOCKS_DICT = {
     # 科網 / 平台經濟
     "0700.HK": "騰訊控股", "9988.HK": "阿里巴巴", "3690.HK": "美團", "9618.HK": "京東集團",
@@ -40,7 +40,7 @@ HK_STOCKS_DICT = {
     "0823.HK": "領展房產基金", "1919.HK": "中遠海控", "0960.HK": "龍湖集團"
 }
 
-# 1. 盈富基金數據下載 (緩存 1 小時)
+# 1. 盈富基金估值數據
 @st.cache_data(ttl=3600)
 def fetch_tracker_data():
     ticker = yf.Ticker("2800.HK")
@@ -63,7 +63,88 @@ def fetch_tracker_data():
     df["Z"] = (df["Yield"] - df["Mean_5Y"]) / df["Std_5Y"]
     return df.dropna(subset=["Z"]).copy(), divs
 
-# 2. 千億 VCP 雷達數據下載 (緩存 1 小時)
+# 2. William O'Neil 大市時機 (FTD & Distribution Days) 計算
+@st.cache_data(ttl=3600)
+def fetch_oneil_market_data():
+    start_str = (datetime.now() - timedelta(days=700)).strftime("%Y-%m-%d")
+    hsi = yf.Ticker("^HSI").history(start=start_str, auto_adjust=True)
+    hsi.index = pd.to_datetime(hsi.index).tz_localize(None)
+    
+    # 若指數本身成交量缺失，則備用 2800.HK 真實成交量作為大市活躍度指標
+    t2800 = yf.Ticker("2800.HK").history(start=start_str, auto_adjust=True)
+    t2800.index = pd.to_datetime(t2800.index).tz_localize(None)
+    
+    if hsi["Volume"].sum() == 0 or hsi["Volume"].isna().all():
+        hsi["Volume"] = t2800["Volume"].reindex(hsi.index).ffill()
+
+    hsi["Ret"] = hsi["Close"].pct_change()
+    hsi["MA50"] = hsi["Close"].rolling(50).mean()
+    hsi["MA200"] = hsi["Close"].rolling(200).mean()
+
+    # 出貨日 (Distribution Day) 判斷：收市跌 >= 0.2% 且 成交量大於前一日
+    is_down_day = hsi["Ret"] <= -0.002
+    is_vol_up = hsi["Volume"] > hsi["Volume"].shift(1)
+    hsi["Is_DD"] = is_down_day & is_vol_up
+
+    # 檢視近 25 個交易日內的所有出貨日及其有效性
+    window_days = 25
+    recent_25 = hsi.iloc[-window_days:].copy()
+    dd_records = []
+    
+    curr_close = hsi["Close"].iloc[-1]
+    
+    for dt, row in recent_25.iterrows():
+        if row["Is_DD"]:
+            dd_price = row["Close"]
+            days_ago = len(hsi.loc[dt:]) - 1
+            # 檢查之後的收市價有無高於該日 5%
+            max_after = hsi.loc[dt:, "Close"].max()
+            erased_by_gain = max_after >= dd_price * 1.05
+            
+            status = "🚨 有效（壓制大市）"
+            if erased_by_gain:
+                status = "✅ 已消化（指數升穿 >5%）"
+                
+            dd_records.append({
+                "日期": dt.strftime("%Y-%m-%d"),
+                "距今交易日": f"{days_ago} 日前",
+                "當日收市點數": f"{dd_price:.0f}",
+                "當日跌幅": f"{row['Ret']*100:.2f}%",
+                "當日成交量爆發": f"比前日升 {((row['Volume']/hsi['Volume'].shift(1).loc[dt])-1)*100:+.1f}%",
+                "當前狀態": status,
+                "is_active": not erased_by_gain
+            })
+
+    active_dd_count = sum(1 for r in dd_records if r["is_active"])
+
+    # 跟進日 (Follow-Through Day, FTD) 檢測
+    # 邏輯：跌浪過後首個向上日為 Day 1，隨後 Day 4-15 內出現單日大升 >= 1.2% 且 放量
+    ftd_records = []
+    for i in range(50, len(hsi)):
+        # 尋找前期跌勢 (低於 20 日低位)
+        sub = hsi.iloc[i-30:i+1]
+        c_today = sub["Close"].iloc[-1]
+        c_prev = sub["Close"].iloc[-2]
+        vol_today = sub["Volume"].iloc[-1]
+        vol_prev = sub["Volume"].iloc[-2]
+        ret = (c_today / c_prev) - 1
+
+        if ret >= 0.012 and vol_today > vol_prev:
+            # 檢查過去 4-15 日內是否曾創波段低位並嘗試反彈
+            past_lows = sub["Low"].iloc[-15:-3]
+            if len(past_lows) > 0 and past_lows.min() < sub["Close"].iloc[-15]:
+                dt_str = sub.index[-1].strftime("%Y-%m-%d")
+                ftd_records.append({
+                    "跟進日日期": dt_str,
+                    "當日點數": f"{c_today:.0f}",
+                    "當日升幅": f"+{ret*100:.2f}%",
+                    "當日成交量增長": f"+{((vol_today/vol_prev)-1)*100:.1f}%",
+                    "目前距今": f"{len(hsi)-1-i} 個交易日"
+                })
+
+    return hsi, dd_records, active_dd_count, ftd_records
+
+# 3. 千億 VCP 雷達數據下載
 @st.cache_data(ttl=3600)
 def fetch_vcp_data():
     start_str = (datetime.now() - timedelta(days=500)).strftime("%Y-%m-%d")
@@ -122,7 +203,7 @@ def fetch_vcp_data():
             is_breakout = (c > high_20_prev) and (vol > vol_ma50 * 1.3)
 
             vol_ratio = (vol / vol_ma50) if vol_ma50 > 0 else 0.0
-            stop_loss = c * 0.93  # -7% 硬止蝕
+            stop_loss = c * 0.93
 
             if is_stage2 and is_tight:
                 if is_breakout:
@@ -158,26 +239,27 @@ def fetch_vcp_data():
     watchlist.sort(key=lambda x: x["dist_val"])
     return hsi, breakout_list, watchlist
 
-# 標題與更新按鈕
+# 標題與更新掣
 col_title, col_btn = st.columns([4, 1])
 with col_title:
     st.title("📈 港股雙核量化系統")
     hk_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    st.caption(f"香港時間更新：{hk_time}｜核心底倉 (2800.HK 息率 SD) ＋ 進攻衛星 (千億 VCP 雷達)")
+    st.caption(f"香港時間更新：{hk_time}｜核心底倉 (2800.HK 息率 SD) ＋ 大市環境 (O'Neil FTD/派發日) ＋ 進攻衛星 (千億 VCP)")
 with col_btn:
     st.write("")
     if st.button("🔄 立即更新數據", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-# 拆成 3 個清晰主分頁
-tab1, tab2, tab3 = st.tabs([
+# 4 個獨立主分頁
+tab1, tab2, tab3, tab4 = st.tabs([
     "🎯 2800.HK 今日估值與階梯",
     "📊 2800.HK 零上帝視角回測",
+    "🚦 O'Neil 大市時機 (FTD / 出貨日)",
     "🚀 千億港股 VCP 突破雷達"
 ])
 
-# ================= 主分頁 1：2800.HK 今日估值與階梯 =================
+# ================= 頁面 1：2800.HK 今日估值與階梯 =================
 with tab1:
     with st.spinner("正在載入盈富基金歷史數據..."):
         df_2800, divs = fetch_tracker_data()
@@ -193,7 +275,7 @@ with tab1:
 
     def get_tier_info(z):
         if z >= 2.0:
-            return "100% 滿倉 (5/5 倉)", "🟢 極度便宜 (+2SD 以上)", "success", "息率高於近5年均值逾兩個標準差，估值極度便宜，建議滿倉配置。"
+            return "100% 滿倉 (5/5 倉)", "🟢 極度便宜 (+2SD 以上)", "success", "息率高於近5年均值逾兩個標準差，安全邊際極強，建議滿倉。"
         elif z >= 1.0:
             return "80% 倉位 (4/5 倉)", "🟢 偏便宜 (+1SD 至 +2SD)", "success", "息率具明顯吸引力，屬於價值低吸區，維持重倉收息兼等反彈。"
         elif z >= 0.0:
@@ -206,7 +288,6 @@ with tab1:
             return "0% 清倉 (0/5 倉)", "🔴 極度昂貴 (-2SD 以下)", "error", "息率處於近5年極低泡沫區，全面獲利離場，現金為王。"
 
     pos_text, zone_label, alert_type, advice = get_tier_info(latest_z)
-
     banner_msg = f"### 今日建議倉位：{pos_text} — {zone_label}\n{advice}（最後交易日：{latest_date}）"
     if alert_type == "success":
         st.success(banner_msg)
@@ -218,7 +299,7 @@ with tab1:
         st.error(banner_msg)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("2800.HK 收市價", f"${latest_price:.2f}")
+    c1.metric("2800.HK 最新收市價", f"${latest_price:.2f}")
     c2.metric("最新股息率", f"{latest_yield:.2f}%", f"近5年均值: {mean_5y:.2f}%", delta_color="off")
     c3.metric("標準差位置 (Z-Score)", f"{latest_z:+.2f} SD", "正數=偏平｜負數=偏貴", delta_color="off")
     c4.metric("過去12個月總派息", f"${latest_div:.2f}", "最近2次派息合計", delta_color="off")
@@ -226,8 +307,6 @@ with tab1:
     st.divider()
 
     st.subheader("📋 6 級息率階梯與 2800.HK 參考價（滾動 5 年均值）")
-    st.caption(f"按今日滾動 5 年均值 ({mean_5y:.2f}%)、標準差 ({std_5y:.2f}%) 及最近 12 個月派息 (${latest_div:.2f}) 自動換算。")
-
     y_p2 = mean_5y + 2 * std_5y
     y_p1 = mean_5y + std_5y
     y_m1 = mean_5y - std_5y
@@ -255,13 +334,7 @@ with tab1:
     chart_df["-2SD (清倉線)"] = df_2800["Mean_5Y"] - 2 * df_2800["Std_5Y"]
     st.line_chart(chart_df)
 
-    with st.expander("💵 查看盈富基金 (2800.HK) 最近 6 次派息紀錄"):
-        recent_divs = divs.tail(6).sort_index(ascending=False).reset_index()
-        recent_divs.columns = ["除淨日", "每股派息 (港元)"]
-        recent_divs["除淨日"] = recent_divs["除淨日"].dt.strftime("%Y-%m-%d")
-        st.dataframe(recent_divs, use_container_width=True, hide_index=True)
-
-# ================= 主分頁 2：2800.HK 零上帝視角回測 (完整恢復) =================
+# ================= 頁面 2：2800.HK 零上帝視角回測 =================
 with tab2:
     st.subheader("📊 滾動 5 年息率 SD 策略：零上帝視角回測（含股息再投資）")
     st.caption("每日只使用「截至當日為止已發生嘅過去 5 年數據」計算標準差與倉位，完全排除未來函數。")
@@ -333,10 +406,75 @@ with tab2:
     m4.metric("長揸最大回撤", f"{bh_d:.1f}%", f"夏普 {bh_s:.2f}", delta_color="off")
 
     st.line_chart(bt[["長揸盈富基金 (含息)", "滾動5年息率策略"]])
-    st.caption("註：已計入盈富基金股息再投資；未扣除券商交易平台費及買賣差價（2800.HK 免印花稅）。")
 
-# ================= 主分頁 3：千億港股 VCP 突破雷達 =================
+# ================= 頁面 3：William O'Neil 大市時機 (FTD / 出貨日) =================
 with tab3:
+    st.subheader("🚦 William O'Neil 大市狀態監察器（CAN SLIM 核心時機）")
+    st.caption("透過恒生指數（^HSI）過去 25 個交易日之機構出貨日（Distribution Days）總數及跟進日（Follow-Through Day, FTD）判斷市場頂底。")
+
+    with st.spinner("正在分析恒指機構出貨日與 FTD 訊號..."):
+        hsi_on, dd_list, active_dd, ftd_list = fetch_oneil_market_data()
+
+    latest_h = hsi_on.iloc[-1]
+    h_close = latest_h["Close"]
+    h_ma50 = latest_h["MA50"]
+    h_ma200 = latest_h["MA200"]
+
+    # 決定 O'Neil 大市燈號
+    if active_dd <= 2:
+        mkt_status = "🟢 確認升勢 (Confirmed Uptrend)"
+        mkt_desc = "過去 25 日只有 0–2 個有效出貨日，市場由買盤主導，機構並未大舉派貨。適合積極參與 VCP 個股突破。"
+        banner_fn = st.success
+    elif 3 <= active_dd <= 4:
+        mkt_status = "🟡 升勢受壓 (Uptrend Under Pressure)"
+        mkt_desc = f"過去 25 日錄得 {active_dd} 個有效出貨日，機構資金開始減磅。建議停止激進追高，將獲利持倉止蝕位收緊至 50MA 保本。"
+        banner_fn = st.warning
+    else:
+        mkt_status = "🔴 市場修正 / 跌勢 (Market in Correction)"
+        mkt_desc = f"過去 25 日錄得高達 {active_dd} 個有效出貨日，大戶全面派發。高機率出現持續回調，嚴格禁止追買任何突破，宜保留大量現金。"
+        banner_fn = st.error
+
+    banner_fn(f"### 當前大市時機狀態：{mkt_status}\n{mkt_desc}")
+
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("恒指最新收市", f"{h_close:.0f} 點")
+    o2.metric("近25日有效出貨日 (DD)", f"{active_dd} 個", "≤2 健康 ｜ 3-4 受壓 ｜ ≥5 危險", delta_color="off")
+    o3.metric("50天均線 (中期趨勢)", f"{h_ma50:.0f} 點", f"{((h_close/h_ma50)-1)*100:+.1f}%", delta_color="off")
+    o4.metric("200天均線 (牛熊分界)", f"{h_ma200:.0f} 點", f"{((h_close/h_ma200)-1)*100:+.1f}%", delta_color="off")
+
+    st.divider()
+
+    col_dd, col_ftd = st.columns([3, 2])
+
+    with col_dd:
+        st.subheader("📦 過去 25 個交易日出貨日（Distribution Days）紀錄")
+        st.caption("定義：單日跌幅 ≥ 0.2% 且成交量大於前一日。若指數隨後反彈超越該日收市價 5%，則自動標記為「已消化」。")
+        if dd_list:
+            df_dd = pd.DataFrame(dd_list).drop(columns=["is_active"])
+            st.dataframe(df_dd, use_container_width=True, hide_index=True)
+        else:
+            st.info("過去 25 個交易日沒有出現任何符合條件之出貨日，大市處於極健康狀態！")
+
+    with col_ftd:
+        st.subheader("🎯 最近跟進日（Follow-Through Day）歷史")
+        st.caption("定義：跌浪後反彈第 4–15 日內，指數單日放量急升 ≥ 1.2%，標誌熊市見底轉強。")
+        if ftd_list:
+            df_ftd = pd.DataFrame(ftd_list[-6:]).iloc[::-1]  # 取最近 6 次
+            st.dataframe(df_ftd, use_container_width=True, hide_index=True)
+        else:
+            st.info("近期暫無新 FTD 訊號。")
+
+    with st.expander("📖 William O'Neil 大市時機法則（實戰操作備忘）"):
+        st.markdown("""
+        * **出貨日累積原理**：大市往往喺頂部依然一片欣欣向榮，但出貨日會提早反映機構暗中派貨。當出貨日喺 4–5 週內累積到 **5 個**，大盤見頂機率超過 80%。
+        * **出貨日點樣消除？**：
+          1. 滿 25 個交易日自然過期。
+          2. 指數自出貨日收市價起向上升幅達 **5%**，該出貨日即時作廢（代表買盤徹底擊潰賣盤）。
+        * **跟進日（FTD）操作**：大跌市千祈唔好左側亂估底；耐心等待出現放量急升的 FTD，翌日方可作為「第一注試水溫」開倉信號。
+        """)
+
+# ================= 頁面 4：千億港股 VCP 突破雷達 =================
+with tab4:
     with st.spinner("正在掃描 82 隻千億市值港股並運算 VCP 形態（約需 10–15 秒）..."):
         hsi, breakouts, watch_list = fetch_vcp_data()
 
@@ -384,7 +522,7 @@ with tab3:
 
     with st.expander("📖 實戰操作與風控紀律說明（50MA 止賺 ＋ -7% 硬止蝕）"):
         st.markdown("""
-        * **1. 大市綠燈才開倉**：只有當上方恒指呈現 **🟢 綠燈** 時，先准按「今日放量突破名單」買入，最多同時持有 5 隻（每隻注碼 20%）。
+        * **1. 大市綠燈才開倉**：只有當上方恒指呈現 **🟢 綠燈**（或 O'Neil 分頁處於確認升勢）時，先准按「今日放量突破名單」買入，最多同時持有 5 隻（每隻注碼 20%）。
         * **2. 觀察名單點樣用？**：睇實「距離突破仲差」低於 3% 嗰幾隻。翌日盤中如果見股價衝破「突破目標價」，且下午成交量明顯放大，尾市（15:55）即可準備入場。
         * **3. 買入即掛 `-7%` 硬止蝕**：按表格提供的「建議 -7% 止蝕價」喺券商掛條件單，盤中掂到無條件即走，保命第一。
         * **4. 50MA 移動止賺離場**：每日下午 4:00 收市檢視，若**收市價正式跌穿 50MA**，翌日開市離場鎖定利潤；未跌穿則安心持貨食盡大浪。
