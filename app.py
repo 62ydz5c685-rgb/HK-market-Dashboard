@@ -63,7 +63,7 @@ def fetch_tracker_data():
     df["Z"] = (df["Yield"] - df["Mean_5Y"]) / df["Std_5Y"]
     return df.dropna(subset=["Z"]).copy(), divs
 
-# 2. 千億 VCP 雷達數據下載 (緩存 1 小時，只下載近 500 天以提升速度)
+# 2. 千億 VCP 雷達數據下載 (緩存 1 小時)
 @st.cache_data(ttl=3600)
 def fetch_vcp_data():
     start_str = (datetime.now() - timedelta(days=500)).strftime("%Y-%m-%d")
@@ -114,20 +114,15 @@ def fetch_vcp_data():
             range_50 = latest["Range_50"]
             rs_60 = (c / d["Close"].iloc[-61] - 1) * 100 if len(d) >= 61 else 0.0
 
-            # 條件 1: 第二階段趨勢模板
             is_stage2 = (
                 (c > ma50) and (ma50 > ma150) and (ma150 > ma200) and
                 (ma200 > ma200_20d_ago) and (c >= high_252 * 0.75)
             )
-
-            # 條件 2: VCP 波幅收縮
             is_tight = (range_10 < 0.15) and (range_10 < range_50 * 0.70)
-
-            # 條件 3: 放量突破
             is_breakout = (c > high_20_prev) and (vol > vol_ma50 * 1.3)
 
             vol_ratio = (vol / vol_ma50) if vol_ma50 > 0 else 0.0
-            stop_loss = c * 0.93  # -7% 硬止蝕價
+            stop_loss = c * 0.93  # -7% 硬止蝕
 
             if is_stage2 and is_tight:
                 if is_breakout:
@@ -163,7 +158,7 @@ def fetch_vcp_data():
     watchlist.sort(key=lambda x: x["dist_val"])
     return hsi, breakout_list, watchlist
 
-# 標題與即時更新按鈕
+# 標題與更新按鈕
 col_title, col_btn = st.columns([4, 1])
 with col_title:
     st.title("📈 港股雙核量化系統")
@@ -175,10 +170,15 @@ with col_btn:
         st.cache_data.clear()
         st.rerun()
 
-main_tab1, main_tab2 = st.tabs(["💰 2800.HK 息率估值系統", "🚀 千億港股 VCP 突破雷達"])
+# 拆成 3 個清晰主分頁
+tab1, tab2, tab3 = st.tabs([
+    "🎯 2800.HK 今日估值與階梯",
+    "📊 2800.HK 零上帝視角回測",
+    "🚀 千億港股 VCP 突破雷達"
+])
 
-# ================= 主分頁 1：2800.HK 息率估值系統 =================
-with main_tab1:
+# ================= 主分頁 1：2800.HK 今日估值與階梯 =================
+with tab1:
     with st.spinner("正在載入盈富基金歷史數據..."):
         df_2800, divs = fetch_tracker_data()
 
@@ -193,7 +193,7 @@ with main_tab1:
 
     def get_tier_info(z):
         if z >= 2.0:
-            return "100% 滿倉 (5/5 倉)", "🟢 極度便宜 (+2SD 以上)", "success", "息率高於近5年均值逾兩個標準差，安全邊際極強，建議滿倉。"
+            return "100% 滿倉 (5/5 倉)", "🟢 極度便宜 (+2SD 以上)", "success", "息率高於近5年均值逾兩個標準差，估值極度便宜，建議滿倉配置。"
         elif z >= 1.0:
             return "80% 倉位 (4/5 倉)", "🟢 偏便宜 (+1SD 至 +2SD)", "success", "息率具明顯吸引力，屬於價值低吸區，維持重倉收息兼等反彈。"
         elif z >= 0.0:
@@ -201,7 +201,7 @@ with main_tab1:
         elif z >= -1.0:
             return "40% 倉位 (2/5 倉)", "🟡 略貴 (-1SD 至均值)", "warning", "估值略高於近5年平均，建議偏防守配置，保留一半以上現金。"
         elif z >= -2.0:
-            return "20% 倉位 (1/5 倉)", "🔴 偏貴 (-2SD 至 -1SD)", "error", "息率跌至近5年偏低水平，市場情緒偏熱，建議分批減至輕倉。"
+            return "20% 倉位 (1/5 倉)", "🔴 偏貴 (-2SD 至 -1SD)", "error", "息率跌至近5年偏低水平，市場情緒偏熱，建議分批獲利減至輕倉。"
         else:
             return "0% 清倉 (0/5 倉)", "🔴 極度昂貴 (-2SD 以下)", "error", "息率處於近5年極低泡沫區，全面獲利離場，現金為王。"
 
@@ -226,6 +226,8 @@ with main_tab1:
     st.divider()
 
     st.subheader("📋 6 級息率階梯與 2800.HK 參考價（滾動 5 年均值）")
+    st.caption(f"按今日滾動 5 年均值 ({mean_5y:.2f}%)、標準差 ({std_5y:.2f}%) 及最近 12 個月派息 (${latest_div:.2f}) 自動換算。")
+
     y_p2 = mean_5y + 2 * std_5y
     y_p1 = mean_5y + std_5y
     y_m1 = mean_5y - std_5y
@@ -241,18 +243,100 @@ with main_tab1:
     ])
     st.dataframe(ladder_df, use_container_width=True, hide_index=True)
 
-    with st.expander("📊 查看 2800.HK 滾動 5 年息率歷史回測與通道圖"):
-        chart_df = pd.DataFrame(index=df_2800.index)
-        chart_df["2800.HK 股息率 (%)"] = df_2800["Yield"]
-        chart_df["+2SD (滿倉線)"] = df_2800["Mean_5Y"] + 2 * df_2800["Std_5Y"]
-        chart_df["+1SD (80%線)"] = df_2800["Mean_5Y"] + df_2800["Std_5Y"]
-        chart_df["5年均值"] = df_2800["Mean_5Y"]
-        chart_df["-1SD (20%線)"] = df_2800["Mean_5Y"] - df_2800["Std_5Y"]
-        chart_df["-2SD (清倉線)"] = df_2800["Mean_5Y"] - 2 * df_2800["Std_5Y"]
-        st.line_chart(chart_df)
+    st.divider()
 
-# ================= 主分頁 2：千億港股 VCP 突破雷達 =================
-with main_tab2:
+    st.subheader("📈 盈富基金股息率與「動態 5 年 SD 通道」走勢 (%)")
+    chart_df = pd.DataFrame(index=df_2800.index)
+    chart_df["2800.HK 股息率 (%)"] = df_2800["Yield"]
+    chart_df["+2SD (滿倉線)"] = df_2800["Mean_5Y"] + 2 * df_2800["Std_5Y"]
+    chart_df["+1SD (80%線)"] = df_2800["Mean_5Y"] + df_2800["Std_5Y"]
+    chart_df["滾動5年均值"] = df_2800["Mean_5Y"]
+    chart_df["-1SD (20%線)"] = df_2800["Mean_5Y"] - df_2800["Std_5Y"]
+    chart_df["-2SD (清倉線)"] = df_2800["Mean_5Y"] - 2 * df_2800["Std_5Y"]
+    st.line_chart(chart_df)
+
+    with st.expander("💵 查看盈富基金 (2800.HK) 最近 6 次派息紀錄"):
+        recent_divs = divs.tail(6).sort_index(ascending=False).reset_index()
+        recent_divs.columns = ["除淨日", "每股派息 (港元)"]
+        recent_divs["除淨日"] = recent_divs["除淨日"].dt.strftime("%Y-%m-%d")
+        st.dataframe(recent_divs, use_container_width=True, hide_index=True)
+
+# ================= 主分頁 2：2800.HK 零上帝視角回測 (完整恢復) =================
+with tab2:
+    st.subheader("📊 滾動 5 年息率 SD 策略：零上帝視角回測（含股息再投資）")
+    st.caption("每日只使用「截至當日為止已發生嘅過去 5 年數據」計算標準差與倉位，完全排除未來函數。")
+
+    opt1, opt2 = st.columns(2)
+    with opt1:
+        rebal_freq = st.radio(
+            "調倉頻率設定",
+            ["每月月底調倉一次（推薦：大幅慳手續費）", "每日收市即時調倉"],
+            horizontal=False
+        )
+    with opt2:
+        cash_rate = st.slider(
+            "空倉現金年息假設（例如擺高息活期／定期／貨幣基金 %）",
+            min_value=0.0, max_value=5.0, value=2.5, step=0.5
+        )
+
+    bt = df_2800.copy()
+    conditions = [
+        bt["Z"] >= 2.0,
+        (bt["Z"] >= 1.0) & (bt["Z"] < 2.0),
+        (bt["Z"] >= 0.0) & (bt["Z"] < 1.0),
+        (bt["Z"] >= -1.0) & (bt["Z"] < 0.0),
+        (bt["Z"] >= -2.0) & (bt["Z"] < -1.0),
+        bt["Z"] < -2.0
+    ]
+    choices = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+    bt["Daily_Target"] = np.select(conditions, choices, default=0.6)
+
+    if "每月月底" in rebal_freq:
+        ym = bt.index.to_period("M")
+        is_month_end = ym != pd.Series(ym, index=bt.index).shift(-1)
+        bt["Target_Pos"] = bt["Daily_Target"].where(is_month_end).ffill().bfill()
+    else:
+        bt["Target_Pos"] = bt["Daily_Target"]
+
+    bt["Position"] = bt["Target_Pos"].shift(1).fillna(0.6)
+    trades = int((bt["Position"].diff().abs() > 0).sum())
+
+    bt["Ret_1d"] = bt["Adj_Close"].pct_change().fillna(0)
+    daily_cash_ret = (1 + cash_rate / 100) ** (1 / 252) - 1
+    bt["Strat_Ret"] = bt["Ret_1d"] * bt["Position"] + daily_cash_ret * (1 - bt["Position"])
+
+    bt["長揸盈富基金 (含息)"] = (1 + bt["Ret_1d"]).cumprod() * 100
+    bt["滾動5年息率策略"] = (1 + bt["Strat_Ret"]).cumprod() * 100
+
+    years = (bt.index[-1] - bt.index[0]).days / 365.25
+
+    def calc_metrics(eq, ret):
+        tot = (eq.iloc[-1] / 100 - 1) * 100
+        cagr = ((eq.iloc[-1] / 100) ** (1 / years) - 1) * 100
+        mdd = ((eq / eq.cummax()) - 1).min() * 100
+        sh = (ret.mean() / ret.std()) * np.sqrt(252) if ret.std() > 0 else 0
+        return tot, cagr, mdd, sh
+
+    bh_t, bh_c, bh_d, bh_s = calc_metrics(bt["長揸盈富基金 (含息)"], bt["Ret_1d"])
+    st_t, st_c, st_d, st_s = calc_metrics(bt["滾動5年息率策略"], bt["Strat_Ret"])
+    avg_pos = bt["Position"].mean() * 100
+
+    st.caption(
+        f"回測區間：{bt.index[0].strftime('%Y-%m-%d')} 至 {latest_date}（約 {years:.1f} 年）｜"
+        f"總調倉次數：{trades} 次（平均每年 {trades/years:.1f} 次）｜平均持股倉位：{avg_pos:.1f}%"
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("策略總回報", f"{st_t:+.1f}%", f"年化 {st_c:+.2f}%")
+    m2.metric("長揸 2800.HK 總回報", f"{bh_t:+.1f}%", f"年化 {bh_c:+.2f}%")
+    m3.metric("策略最大回撤", f"{st_d:.1f}%", f"夏普 {st_s:.2f}", delta_color="off")
+    m4.metric("長揸最大回撤", f"{bh_d:.1f}%", f"夏普 {bh_s:.2f}", delta_color="off")
+
+    st.line_chart(bt[["長揸盈富基金 (含息)", "滾動5年息率策略"]])
+    st.caption("註：已計入盈富基金股息再投資；未扣除券商交易平台費及買賣差價（2800.HK 免印花稅）。")
+
+# ================= 主分頁 3：千億港股 VCP 突破雷達 =================
+with tab3:
     with st.spinner("正在掃描 82 隻千億市值港股並運算 VCP 形態（約需 10–15 秒）..."):
         hsi, breakouts, watch_list = fetch_vcp_data()
 
@@ -290,7 +374,7 @@ with main_tab2:
 
     # 2. 形態收縮就緒（觀察名單）
     st.subheader(f"👀 形態收縮就緒・即將突破觀察名單（共 {len(watch_list)} 隻）")
-    st.caption("符合條件：第二階段趨勢向上 ＋ 近 10 日波幅收縮至 15% 內且乾量洗盤完成，但**尚未突破前高**。按「距離突破差幅」由近至遠排序，方便盤前早作準備！")
+    st.caption("符合條件：第二階段趨勢向上 ＋ 近 10 日波幅收縮至 15% 內且乾量洗盤完成，但尚未突破前高。按「距離突破差幅」由近至遠排序。")
 
     if watch_list:
         w_df = pd.DataFrame(watch_list).drop(columns=["dist_val"])
@@ -298,7 +382,6 @@ with main_tab2:
     else:
         st.info("今日暫無千億股票處於「VCP 收縮就緒」狀態。")
 
-    # 實戰操作提示手冊
     with st.expander("📖 實戰操作與風控紀律說明（50MA 止賺 ＋ -7% 硬止蝕）"):
         st.markdown("""
         * **1. 大市綠燈才開倉**：只有當上方恒指呈現 **🟢 綠燈** 時，先准按「今日放量突破名單」買入，最多同時持有 5 隻（每隻注碼 20%）。
