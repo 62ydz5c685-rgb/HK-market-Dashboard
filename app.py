@@ -22,22 +22,60 @@ HSI_STOCKS = [
 
 @st.cache_data(ttl=3600)
 def fetch_market_data():
-    # 1. 恒生指數 (^HSI)
     hsi = yf.Ticker("^HSI").history(period="2y")
-    
-    # 2. 盈富基金 (2800.HK)
     tracker = yf.Ticker("2800.HK").history(period="6mo")
-    
-    # 3. 美債避險比率 (HYG / IEF)
     hyg = yf.Ticker("HYG").history(period="1y")
     ief = yf.Ticker("IEF").history(period="1y")
-    
-    # 4. 藍籌股市寬數據
     breadth_data = yf.download(
         HSI_STOCKS, period="6mo", group_by="ticker", progress=False, threads=True
     )
-    
     return hsi, tracker, hyg, ief, breadth_data
+
+def detect_ftd(df):
+    """偵測 William O'Neil 跟進日 (Follow-Through Day)"""
+    recent = df.tail(60).copy()
+    recent["Pct_Change"] = recent["Close"].pct_change()
+    recent["Vol_Up"] = recent["Volume"] > recent["Volume"].shift(1)
+    recent["Upper_Half"] = recent["Close"] >= (recent["High"] + recent["Low"]) / 2
+
+    # 找出近 40 個交易日的最低點
+    lookback = recent.tail(40)
+    min_idx = lookback["Low"].idxmin()
+    sub = recent.loc[min_idx:].copy()
+
+    rally_day = 0
+    rally_low = sub["Low"].iloc[0]
+    ftd_info = None
+
+    for i in range(len(sub)):
+        row = sub.iloc[i]
+        date_str = sub.index[i].strftime("%Y-%m-%d")
+
+        if rally_day == 0:
+            # 第 1 日（嘗試反彈）：當日倒升，或收市企穩全日波幅上半部
+            if row["Pct_Change"] > 0 or row["Upper_Half"]:
+                rally_day = 1
+                rally_low = min(rally_low, row["Low"])
+        else:
+            # 跌穿反彈防守低位 -> 失敗並重置
+            if row["Low"] < rally_low:
+                rally_day = 0
+                rally_low = row["Low"]
+                ftd_info = None
+                if row["Pct_Change"] > 0 or row["Upper_Half"]:
+                    rally_day = 1
+            else:
+                rally_day += 1
+                # 第 4 日或之後：升 >= 1.25% 且成交大於前一日
+                if rally_day >= 4 and ftd_info is None:
+                    if row["Pct_Change"] >= 0.0125 and row["Vol_Up"]:
+                        ftd_info = {
+                            "date": date_str,
+                            "day": rally_day,
+                            "gain": row["Pct_Change"] * 100
+                        }
+
+    return rally_day, rally_low, ftd_info
 
 # 標題與手動更新掣
 col_title, col_btn = st.columns([4, 1])
@@ -120,6 +158,9 @@ elif dist_days <= 4:
 else:
     score_inst, light_inst, desc_inst = 0, "🔴 危險", "機構密集撤退，見頂風險高"
 
+# --- 計算 William O'Neil 跟進日 (FTD) ---
+rally_day, rally_low, ftd_info = detect_ftd(tracker)
+
 # --- 總評分顯示 ---
 total_score = score_trend + score_breadth + score_bond + score_inst
 
@@ -130,6 +171,29 @@ elif total_score >= 3:
     st.warning(f"### 總評分：{total_score} / 8 分 — 🟡 提高警覺區\n市場出現轉弱或分歧訊號。建議停止開新倉、收緊止蝕位，並考慮適度減磅。（恒指最後交易日：{hsi_date}）")
 else:
     st.error(f"### 總評分：{total_score} / 8 分 — 🔴 高度危險區\n系統性風險偏高，建議以現金為主，嚴控倉位，避免隨便撈底。（恒指最後交易日：{hsi_date}）")
+
+# --- O'Neil 跟進日 (FTD) 專屬狀態欄 ---
+if ftd_info:
+    st.success(
+        f"🚀 **O'Neil 跟進日 (FTD) 已確認！**｜"
+        f"盈富基金 (2800.HK) 於 **{ftd_info['date']}**（反彈第 {ftd_info['day']} 日）"
+        f"放量上升 **+{ftd_info['gain']:.2f}%**，且至今未跌穿反彈防守低位 **{rally_low:.2f}**，可留意轉勢機會。"
+    )
+elif rally_day >= 4:
+    st.warning(
+        f"⏳ **O'Neil 跟進日監察中（嘗試反彈第 {rally_day} 日）**｜"
+        f"2800.HK 暫守住反彈低位 **{rally_low:.2f}**，正等待單日升 ≥1.25% 且成交大於前一日的確認訊號。"
+    )
+elif rally_day >= 1:
+    st.info(
+        f"👀 **O'Neil 嘗試反彈初期（第 {rally_day} 日）**｜"
+        f"2800.HK 剛於低位 **{rally_low:.2f}** 出現止跌跡象，需待第 4 日或之後才可確認跟進日。"
+    )
+else:
+    st.info(
+        f"⚪ **O'Neil 跟進日狀態：未見反彈訊號**｜"
+        f"2800.HK 剛創近期低位（{rally_low:.2f}）或尚未出現止跌日，建議耐心觀望。"
+    )
 
 if breadth_pct < 15:
     st.info("🟣 **極度超賣提示**：目前市寬低於 15%，代表跌勢已相當極端，短期容易出現技術反彈，切忌在此位置恐慌斬倉。")
