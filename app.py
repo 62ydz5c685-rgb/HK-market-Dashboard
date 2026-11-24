@@ -5,218 +5,213 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 
 # 網頁基本設定
-st.set_page_config(page_title="港股逆向價值波段系統", page_icon="🎯", layout="wide")
-
-HSI_STOCKS = [
-    "0700.HK", "9988.HK", "0005.HK", "1299.HK", "3690.HK",
-    "0939.HK", "0941.HK", "1398.HK", "0388.HK", "2318.HK",
-    "0883.HK", "1810.HK", "1211.HK", "0981.HK", "3988.HK",
-    "0011.HK", "0001.HK", "0002.HK", "0003.HK", "0006.HK",
-    "0016.HK", "0027.HK", "0066.HK", "0175.HK", "0267.HK",
-    "0288.HK", "0291.HK", "0386.HK", "0669.HK", "0688.HK",
-    "0762.HK", "0823.HK", "0857.HK", "0960.HK", "0968.HK",
-    "0992.HK", "1038.HK", "1093.HK", "1109.HK", "1113.HK",
-    "1177.HK", "1928.HK", "2020.HK", "2269.HK", "2313.HK",
-    "2319.HK", "2382.HK", "2628.HK", "9618.HK", "9999.HK"
-]
+st.set_page_config(page_title="盈富基金息率 SD 倉位系統", page_icon="💰", layout="wide")
 
 @st.cache_data(ttl=3600)
-def fetch_market_data():
-    hsi = yf.Ticker("^HSI").history(period="2y")
-    tracker = yf.Ticker("2800.HK").history(period="6mo")
-    breadth_data = yf.download(
-        HSI_STOCKS, period="6mo", group_by="ticker", progress=False, threads=True
-    )
-    return hsi, tracker, breadth_data
+def fetch_tracker_data():
+    ticker = yf.Ticker("2800.HK")
+    raw = ticker.history(start="2005-01-01", auto_adjust=False)
+    raw.index = pd.to_datetime(raw.index).tz_localize(None)
+    raw = raw.dropna(subset=["Close", "Adj Close"])
 
-@st.cache_data(ttl=86400)
-def run_backtest_data():
-    hsi = yf.Ticker("^HSI").history(period="4y")
-    stocks_close = yf.download(HSI_STOCKS, period="4y", progress=False, threads=True)["Close"]
+    # 2800.HK 每年派息 2 次，取最近 2 次派息總和作為過去 12 個月派息 (TTM)
+    divs = raw[raw["Dividends"] > 0]["Dividends"]
+    ttm_div = divs.rolling(2).sum().reindex(raw.index).ffill()
 
-    for d in [hsi, stocks_close]:
-        d.index = pd.to_datetime(d.index).tz_localize(None)
+    df = pd.DataFrame(index=raw.index)
+    df["Close"] = raw["Close"]
+    df["Adj_Close"] = raw["Adj Close"]
+    df["TTM_Div"] = ttm_div
+    df["Yield"] = (df["TTM_Div"] / df["Close"]) * 100
 
-    df = pd.DataFrame(index=hsi.index)
-    df["HSI"] = hsi["Close"]
-    df["MA20"] = df["HSI"].rolling(20).mean()
-    df["MA50"] = df["HSI"].rolling(50).mean()
-    
-    # 恒指與20天線乖離率 (BIAS)
-    df["Bias_20"] = (df["HSI"] - df["MA20"]) / df["MA20"] * 100
+    df = df.dropna(subset=["Yield"]).copy()
+    return df, divs
 
-    # 藍籌市寬計算
-    stocks_aligned = stocks_close.reindex(df.index).ffill()
-    stocks_ma50 = stocks_aligned.rolling(50).mean()
-    valid_cnt = stocks_ma50.notna().sum(axis=1)
-    above_cnt = (stocks_aligned > stocks_ma50).sum(axis=1)
-    df["Breadth"] = (above_cnt / valid_cnt * 100).fillna(0)
+def get_tier_info(z):
+    if z >= 2.0:
+        return 1.0, "🟢 極度便宜 (+2SD 以上)", "100% 滿倉 (5/5 倉)", "success", "估值處於歷史極端低位，高息具極強安全邊際，建議滿倉配置。"
+    elif z >= 1.0:
+        return 0.8, "🟢 偏便宜 (+1SD 至 +2SD)", "80% 倉位 (4/5 倉)", "success", "息率具吸引力，屬於價值低吸區，可維持高倉位收息兼等反彈。"
+    elif z >= 0.0:
+        return 0.6, "🟡 略便宜 (均值至 +1SD)", "60% 倉位 (3/5 倉)", "info", "估值略低於歷史平均，適合維持中高倉位穩健持貨。"
+    elif z >= -1.0:
+        return 0.4, "🟡 略貴 (-1SD 至均值)", "40% 倉位 (2/5 倉)", "warning", "估值略高於歷史平均，建議保持偏防守倉位，保留一半以上現金。"
+    elif z >= -2.0:
+        return 0.2, "🔴 偏貴 (-2SD 至 -1SD)", "20% 倉位 (1/5 倉)", "error", "息率跌至偏低水平，市場情緒偏熱，建議分批獲利減至輕倉。"
+    else:
+        return 0.0, "🔴 極度昂貴 (-2SD 以下)", "0% 清倉 (0/5 倉)", "error", "息率處於歷史極低泡沫區，建議全面獲利離場，現金為王等待回調。"
 
-    # 逆向波段評分邏輯 (Mean Reversion)
-    # 1. 市寬逆向評分: <25%超賣(2分), 25%-60%中性(1分), >60%過熱(0分)
-    df["S_Breadth"] = np.where(df["Breadth"] < 25, 2, np.where(df["Breadth"] <= 60, 1, 0))
-
-    # 2. 乖離率逆向評分: <-4%恐慌低吸(2分), -4%至+3%正常(1分), >+3%追高過熱(0分)
-    df["S_Bias"] = np.where(df["Bias_20"] < -4.0, 2, np.where(df["Bias_20"] <= 3.0, 1, 0))
-
-    # 總評分 (滿分 4 分)
-    df["Score"] = df["S_Breadth"] + df["S_Bias"]
-    df = df.dropna(subset=["MA50"]).copy()
-
-    df["Zone"] = np.where(
-        df["Score"] >= 3, "🟢 恐慌低吸區 (3-4分)",
-        np.where(df["Score"] >= 2, "🟡 中性持有區 (2分)", "🔴 過熱獲利區 (0-1分)")
-    )
-
-    df["Ret_1d"] = df["HSI"].pct_change().fillna(0)
-    df["Fwd_20d"] = df["HSI"].shift(-20) / df["HSI"] - 1
-    df["Fwd_60d"] = df["HSI"].shift(-60) / df["HSI"] - 1
-
-    # 模擬策略倉位：恐慌超賣時 100% 滿倉抄底；中性時 50% 持股；過熱時 0% 獲利離場避險
-    pos = np.where(df["Score"] >= 3, 1.0, np.where(df["Score"] >= 2, 0.5, 0.0))
-    df["Position"] = pd.Series(pos, index=df.index).shift(1).fillna(0)
-    df["Strat_Ret"] = df["Ret_1d"] * df["Position"]
-
-    df["恒指長揸 (Buy & Hold)"] = (1 + df["Ret_1d"]).cumprod() * 100
-    df["逆向波段策略"] = (1 + df["Strat_Ret"]).cumprod() * 100
-
-    return df
-
-# 標題與更新按鈕
+# 標題與手動更新掣
 col_title, col_btn = st.columns([4, 1])
 with col_title:
-    st.title("🎯 港股逆向價值波段系統")
+    st.title("💰 盈富基金 (2800.HK) 息率 SD 倉位系統")
     hk_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    st.caption(f"香港時間更新：{hk_time}（專為港股上落市設計：逢恐慌超賣分注吸納，過熱逢高分批獲利）")
+    st.caption(f"香港時間更新：{hk_time}（建議每日 16:30 收市後或每月底檢視）")
 with col_btn:
     st.write("")
     if st.button("🔄 立即更新數據", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-tab1, tab2 = st.tabs(["🎯 今日波段體檢", "📊 逆向策略回測 (Backtest)"])
+with st.spinner("正在從 Yahoo Finance 下載盈富基金歷史價格與派息數據..."):
+    df, divs = fetch_tracker_data()
 
-# ================= 分頁 1：今日波段體檢 =================
+# 計算全期息率均值與標準差
+mean_y = df["Yield"].mean()
+std_y = df["Yield"].std()
+df["Z"] = (df["Yield"] - mean_y) / std_y
+
+# 最新數據
+latest = df.iloc[-1]
+latest_date = df.index[-1].strftime("%Y-%m-%d")
+latest_price = latest["Close"]
+latest_div = latest["TTM_Div"]
+latest_yield = latest["Yield"]
+latest_z = latest["Z"]
+
+target_pos, zone_label, pos_text, alert_type, advice = get_tier_info(latest_z)
+
+tab1, tab2 = st.tabs(["🎯 今日息率與建議倉位", "📊 歷史回測驗證"])
+
+# ================= 分頁 1：今日息率與建議倉位 =================
 with tab1:
-    with st.spinner("正在下載港股最新收市數據..."):
-        hsi, tracker, breadth_data = fetch_market_data()
-
-    hsi["MA20"] = hsi["Close"].rolling(20).mean()
-    hsi["MA50"] = hsi["Close"].rolling(50).mean()
-    hsi_close = hsi["Close"].iloc[-1]
-    hsi_ma20 = hsi["MA20"].iloc[-1]
-    hsi_ma50 = hsi["MA50"].iloc[-1]
-    bias_20 = (hsi_close - hsi_ma20) / hsi_ma20 * 100
-    hsi_date = hsi.index[-1].strftime("%Y-%m-%d")
-
-    # 藍籌市寬
-    above_50, valid_stocks = 0, 0
-    for ticker in HSI_STOCKS:
-        try:
-            closes = breadth_data[ticker]["Close"].dropna()
-            if len(closes) >= 50:
-                valid_stocks += 1
-                if closes.iloc[-1] > closes.rolling(50).mean().iloc[-1]:
-                    above_50 += 1
-        except Exception:
-            continue
-
-    breadth_pct = (above_50 / valid_stocks * 100) if valid_stocks > 0 else 0
-
-    # 逆向指標計分
-    if breadth_pct < 25:
-        score_breadth, light_breadth = 2, "🟢 極度超賣 (2/2分)"
-        desc_breadth = "市寬跌破 25%，大市極度恐慌，具備高勝率反彈條件"
-    elif breadth_pct <= 60:
-        score_breadth, light_breadth = 1, "🟡 正常區間 (1/2分)"
-        desc_breadth = "市寬處於 25%-60%，健康整固中"
+    # 頂部總結論橫額
+    banner_msg = (
+        f"### 今日建議倉位：{pos_text} — {zone_label}\n"
+        f"{advice}（最後交易日：{latest_date}）"
+    )
+    if alert_type == "success":
+        st.success(banner_msg)
+    elif alert_type == "info":
+        st.info(banner_msg)
+    elif alert_type == "warning":
+        st.warning(banner_msg)
     else:
-        score_breadth, light_breadth = 0, "🔴 嚴重過熱 (0/2分)"
-        desc_breadth = "市寬超過 60%，市場追高情緒過熱，隨時見頂回吐"
+        st.error(banner_msg)
 
-    if bias_20 < -4.0:
-        score_bias, light_bias = 2, "🟢 深度負乖離 (2/2分)"
-        desc_bias = f"低於20天線 {abs(bias_20):.1f}%，超賣嚴重，跌無可跌"
-    elif bias_20 <= 3.0:
-        score_bias, light_bias = 1, "🟡 正常波動 (1/2分)"
-        desc_bias = f"偏離20天線 {bias_20:+.1f}%，走勢平穩"
-    else:
-        score_bias, light_bias = 0, "🔴 正乖離過高 (0/2分)"
-        desc_bias = f"高於20天線 {bias_20:+.1f}%，短線急抽過度，忌追高"
-
-    total_score = score_breadth + score_bias
+    # 4 張核心數字卡
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("2800.HK 最新收市價", f"${latest_price:.2f}")
+    c2.metric("最新股息率 (TTM)", f"{latest_yield:.2f}%", f"歷史均值: {mean_y:.2f}%", delta_color="off")
+    c3.metric("標準差位置 (Z-Score)", f"{latest_z:+.2f} SD", "正數=偏平｜負數=偏貴", delta_color="off")
+    c4.metric("過去12個月總派息", f"${latest_div:.2f}", "最近2次派息合計", delta_color="off")
 
     st.divider()
-    if total_score >= 3:
-        st.success(f"### 總評分：{total_score} / 4 分 — 🟢 恐慌低吸區 (建議 100% 分注建倉)\n市場進入極端超賣或深度負乖離，港股勝率極高，適合分注吸納盈富基金或優質龍頭股。（恒指交易日：{hsi_date}）")
-    elif total_score == 2:
-        st.info(f"### 總評分：{total_score} / 4 分 — 🟡 中性持有區 (建議 50% 倉位)\n市況處於正常波動區間，已持貨者可安心讓利潤奔跑，未持貨者不宜追高。（恒指交易日：{hsi_date}）")
-    else:
-        st.error(f"### 總評分：{total_score} / 4 分 — 🔴 過熱獲利區 (建議 0%-20% 空倉/避險)\n技術面出現嚴重超買或正乖離過大，歷史上容易出現深度回調，建議果斷逢高分批止賺鎖定利潤。（恒指交易日：{hsi_date}）")
+
+    # 6 級息率與目標價對照表
+    st.subheader("📋 6 級息率階梯與 2800.HK 對應參考價")
+    st.caption(f"數據統計區間：{df.index[0].strftime('%Y-%m-%d')} 至 {latest_date}｜參考價按現時過去12個月派息 (${latest_div:.2f}) 自動換算。")
+
+    y_p2 = mean_y + 2 * std_y
+    y_p1 = mean_y + std_y
+    y_m1 = mean_y - std_y
+    y_m2 = mean_y - 2 * std_y
+
+    p_p2 = latest_div / (y_p2 / 100)
+    p_p1 = latest_div / (y_p1 / 100)
+    p_mean = latest_div / (mean_y / 100)
+    p_m1 = latest_div / (y_m1 / 100)
+    p_m2 = latest_div / (y_m2 / 100)
+
+    ladder_df = pd.DataFrame([
+        {"估值區間": "🟢 極度便宜 (> +2 SD)", "建議倉位": "100% (5/5 倉)", "觸發息率": f"≥ {y_p2:.2f}%", "2800.HK 參考價": f"${p_p2:.2f} 或以下", "目前位置": "👈 今日位置" if latest_z >= 2.0 else ""},
+        {"估值區間": "🟢 偏便宜 (+1 至 +2 SD)", "建議倉位": "80% (4/5 倉)", "觸發息率": f"{y_p1:.2f}% – {y_p2:.2f}%", "2800.HK 參考價": f"${p_p2:.2f} – ${p_p1:.2f}", "目前位置": "👈 今日位置" if 1.0 <= latest_z < 2.0 else ""},
+        {"估值區間": "🟡 略便宜 (Mean 至 +1 SD)", "建議倉位": "60% (3/5 倉)", "觸發息率": f"{mean_y:.2f}% – {y_p1:.2f}%", "2800.HK 參考價": f"${p_p1:.2f} – ${p_mean:.2f}", "目前位置": "👈 今日位置" if 0.0 <= latest_z < 1.0 else ""},
+        {"估值區間": "🟡 略貴 (-1 SD 至 Mean)", "建議倉位": "40% (2/5 倉)", "觸發息率": f"{y_m1:.2f}% – {mean_y:.2f}%", "2800.HK 參考價": f"${p_mean:.2f} – ${p_m1:.2f}", "目前位置": "👈 今日位置" if -1.0 <= latest_z < 0.0 else ""},
+        {"估值區間": "🔴 偏貴 (-2 至 -1 SD)", "建議倉位": "20% (1/5 倉)", "觸發息率": f"{y_m2:.2f}% – {y_m1:.2f}%", "2800.HK 參考價": f"${p_m1:.2f} – ${p_m2:.2f}", "目前位置": "👈 今日位置" if -2.0 <= latest_z < -1.0 else ""},
+        {"估值區間": "🔴 極度昂貴 (< -2 SD)", "建議倉位": "0% (0/5 倉)", "觸發息率": f"< {y_m2:.2f}%", "2800.HK 參考價": f"${p_m2:.2f} 或以上", "目前位置": "👈 今日位置" if latest_z < -2.0 else ""},
+    ])
+    st.dataframe(ladder_df, use_container_width=True, hide_index=True)
 
     st.divider()
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("1. 藍籌市寬狀態")
-        st.metric("企穩 50 天線藍籌比例", f"{breadth_pct:.1f}%", f"{above_50} / {valid_stocks} 隻")
-        st.markdown(f"**狀態：{light_breadth}**")
-        st.caption(desc_breadth)
-    with c2:
-        st.subheader("2. 恒指 20 天線乖離率 (BIAS)")
-        st.metric("恒指收市價與乖離", f"{hsi_close:,.0f}", f"{bias_20:+.2f}% 偏離 20MA")
-        st.markdown(f"**狀態：{light_bias}**")
-        st.caption(desc_bias)
 
-    st.divider()
-    st.subheader("恒生指數走勢與 20 天、50 天線")
-    st.line_chart(hsi[["Close", "MA20", "MA50"]].tail(250).rename(columns={"Close": "恒指收市", "MA20": "20天線", "MA50": "50天線"}))
+    # 歷史息率 SD 通道圖表
+    st.subheader("📈 盈富基金歷史股息率與 SD 通道走勢 (%)")
+    chart_df = pd.DataFrame(index=df.index)
+    chart_df["2800.HK 股息率 (%)"] = df["Yield"]
+    chart_df["+2SD (100%滿倉線)"] = y_p2
+    chart_df["+1SD (80%線)"] = y_p1
+    chart_df["歷史均值"] = mean_y
+    chart_df["-1SD (20%線)"] = y_m1
+    chart_df["-2SD (0%清倉線)"] = y_m2
+    st.line_chart(chart_df)
 
-# ================= 分頁 2：歷史回測 =================
+    # 最近派息紀錄參考
+    with st.expander("💵 查看盈富基金 (2800.HK) 最近 6 次派息紀錄"):
+        recent_divs = divs.tail(6).sort_index(ascending=False).reset_index()
+        recent_divs.columns = ["除淨日", "每股派息 (港元)"]
+        recent_divs["除淨日"] = recent_divs["除淨日"].dt.strftime("%Y-%m-%d")
+        st.dataframe(recent_divs, use_container_width=True, hide_index=True)
+
+# ================= 分頁 2：歷史回測驗證 =================
 with tab2:
-    st.subheader("📊 逆向價值波段策略：歷史回測驗證")
-    st.caption("回測邏輯：當市場恐慌超賣 (3-4分) 時 100% 滿倉抄底；中性 (2分) 時 50% 持貨；過熱 (0-1分) 時 0% 空倉獲利離場。")
+    st.subheader("📊 息率 SD 階梯策略：歷史回測驗證（含股息再投資）")
 
-    if st.button("🚀 開始執行逆向策略回測", type="primary"):
-        with st.spinner("正在計算過去 4 年每日逆向評分與收益率，約需 10 秒..."):
-            bt = run_backtest_data()
+    opt1, opt2 = st.columns(2)
+    with opt1:
+        rebal_freq = st.radio(
+            "調倉頻率設定",
+            ["每月月底調倉一次（推薦：大幅慳手續費）", "每日收市即時調倉"],
+            horizontal=False
+        )
+    with opt2:
+        cash_rate = st.slider(
+            "空倉現金年息假設（例如擺定期／貨幣基金 %）",
+            min_value=0.0, max_value=5.0, value=2.5, step=0.5
+        )
 
-        start_d = bt.index[0].strftime("%Y-%m-%d")
-        end_d = bt.index[-1].strftime("%Y-%m-%d")
-        st.success(f"回測完成！區間：{start_d} 至 {end_d}（共 {len(bt)} 個交易日）")
+    bt = df.copy()
+    conditions = [
+        bt["Z"] >= 2.0,
+        (bt["Z"] >= 1.0) & (bt["Z"] < 2.0),
+        (bt["Z"] >= 0.0) & (bt["Z"] < 1.0),
+        (bt["Z"] >= -1.0) & (bt["Z"] < 0.0),
+        (bt["Z"] >= -2.0) & (bt["Z"] < -1.0),
+        bt["Z"] < -2.0
+    ]
+    choices = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+    bt["Daily_Target"] = np.select(conditions, choices, default=0.6)
 
-        st.markdown("#### 1. 各評分區間下，恒指之後的表現統計")
-        summary_rows = []
-        for zone in ["🟢 恐慌低吸區 (3-4分)", "🟡 中性持有區 (2分)", "🔴 過熱獲利區 (0-1分)"]:
-            sub = bt[bt["Zone"] == zone]
-            if len(sub) > 0:
-                avg_20 = sub["Fwd_20d"].mean() * 100
-                win_20 = (sub["Fwd_20d"] > 0).mean() * 100
-                avg_60 = sub["Fwd_60d"].mean() * 100
-                win_60 = (sub["Fwd_60d"] > 0).mean() * 100
-                summary_rows.append({
-                    "狀態分區": zone,
-                    "出現日數": f"{len(sub)} 日",
-                    "後20日平均升跌": f"{avg_20:+.2f}%",
-                    "後20日勝率": f"{win_20:.1f}%",
-                    "後60日平均升跌": f"{avg_60:+.2f}%",
-                    "後60日勝率": f"{win_60:.1f}%",
-                })
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    if "每月月底" in rebal_freq:
+        # 只於每月最後一個交易日更新目標倉位
+        monthly_sig = bt["Daily_Target"].resample("ME").last()
+        bt["Target_Pos"] = monthly_sig.reindex(bt.index, method="ffill").bfill()
+    else:
+        bt["Target_Pos"] = bt["Daily_Target"]
 
-        st.markdown("#### 2. 逆向波段策略 vs 長揸恒指（起點 = 100）")
-        bh_ret = bt["恒指長揸 (Buy & Hold)"].iloc[-1] - 100
-        st_ret = bt["逆向波段策略"].iloc[-1] - 100
+    bt["Position"] = bt["Target_Pos"].shift(1).fillna(0.6)
+    trades = int((bt["Position"].diff().abs() > 0).sum())
 
-        def max_dd(series):
-            return ((series / series.cummax()) - 1).min() * 100
+    bt["Ret_1d"] = bt["Adj_Close"].pct_change().fillna(0)
+    daily_cash_ret = (1 + cash_rate / 100) ** (1 / 252) - 1
+    bt["Strat_Ret"] = bt["Ret_1d"] * bt["Position"] + daily_cash_ret * (1 - bt["Position"])
 
-        bh_dd = max_dd(bt["恒指長揸 (Buy & Hold)"])
-        st_dd = max_dd(bt["逆向波段策略"])
+    bt["長揸盈富基金 (含息)"] = (1 + bt["Ret_1d"]).cumprod() * 100
+    bt["息率 SD 階梯策略"] = (1 + bt["Strat_Ret"]).cumprod() * 100
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("逆向策略總回報", f"{st_ret:+.1f}%")
-        m2.metric("長揸恒指總回報", f"{bh_ret:+.1f}%")
-        m3.metric("逆向策略最大回撤", f"{st_dd:.1f}%")
-        m4.metric("長揸恒指最大回撤", f"{bh_dd:.1f}%")
+    years = (bt.index[-1] - bt.index[0]).days / 365.25
 
-        st.line_chart(bt[["恒指長揸 (Buy & Hold)", "逆向波段策略"]])
+    def calc_metrics(eq, ret):
+        tot = (eq.iloc[-1] / 100 - 1) * 100
+        cagr = ((eq.iloc[-1] / 100) ** (1 / years) - 1) * 100
+        mdd = ((eq / eq.cummax()) - 1).min() * 100
+        sh = (ret.mean() / ret.std()) * np.sqrt(252) if ret.std() > 0 else 0
+        return tot, cagr, mdd, sh
+
+    bh_t, bh_c, bh_d, bh_s = calc_metrics(bt["長揸盈富基金 (含息)"], bt["Ret_1d"])
+    st_t, st_c, st_d, st_s = calc_metrics(bt["息率 SD 階梯策略"], bt["Strat_Ret"])
+    avg_pos = bt["Position"].mean() * 100
+
+    st.caption(
+        f"回測區間：{bt.index[0].strftime('%Y-%m-%d')} 至 {latest_date}（約 {years:.1f} 年）｜"
+        f"總調倉次數：{trades} 次（平均每年 {trades/years:.1f} 次）｜平均持股倉位：{avg_pos:.1f}%"
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("策略總回報", f"{st_t:+.1f}%", f"年化 {st_c:+.2f}%")
+    m2.metric("長揸 2800.HK 總回報", f"{bh_t:+.1f}%", f"年化 {bh_c:+.2f}%")
+    m3.metric("策略最大回撤", f"{st_d:.1f}%", f"夏普 {st_s:.2f}", delta_color="off")
+    m4.metric("長揸最大回撤", f"{bh_d:.1f}%", f"夏普 {bh_s:.2f}", delta_color="off")
+
+    st.line_chart(bt[["長揸盈富基金 (含息)", "息率 SD 階梯策略"]])
+    st.caption("註：歷史息率均值與標準差以全期數據計算，實際操作建議配合成交成本及個人風險承受能力執行。")
