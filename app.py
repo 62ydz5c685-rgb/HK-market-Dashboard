@@ -41,12 +41,23 @@ HK_STOCKS_DICT = {
 }
 
 # 1. 盈富基金估值數據
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800)
 def fetch_tracker_data():
     ticker = yf.Ticker("2800.HK")
-    raw = ticker.history(start="2005-01-01", auto_adjust=False)
+    # 長歷史 (算 5 年 SD 用) + 最近 5 日 (避開長歷史伺服器緩存延遲)
+    raw_hist = ticker.history(start="2005-01-01", auto_adjust=False)
+    raw_recent = ticker.history(period="5d", auto_adjust=False)
+    raw = pd.concat([raw_hist, raw_recent])
+    raw = raw[~raw.index.duplicated(keep="last")].sort_index()
     raw.index = pd.to_datetime(raw.index).tz_localize(None)
-    raw = raw.dropna(subset=["Close", "Adj Close"])
+
+    # 關鍵修復：若 Yahoo 尚未計算最新一天的 Adj Close，自動以 Close 填補，絕不刪除最新日
+    if "Adj Close" in raw.columns:
+        raw["Adj Close"] = raw["Adj Close"].fillna(raw["Close"])
+    else:
+        raw["Adj Close"] = raw["Close"]
+
+    raw = raw.dropna(subset=["Close"])
 
     divs = raw[raw["Dividends"] > 0]["Dividends"]
     ttm_div = divs.rolling(2).sum().reindex(raw.index).ffill()
@@ -62,6 +73,7 @@ def fetch_tracker_data():
     df["Std_5Y"] = df["Yield"].rolling("1825D", min_periods=252).std()
     df["Z"] = (df["Yield"] - df["Mean_5Y"]) / df["Std_5Y"]
     return df.dropna(subset=["Z"]).copy(), divs
+
 
 # 2. William O'Neil 大市時機 (FTD & Distribution Days) 計算
 @st.cache_data(ttl=3600)
