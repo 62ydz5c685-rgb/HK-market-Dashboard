@@ -81,11 +81,11 @@ def fetch_oneil_market_data():
     start_str = (datetime.now() - timedelta(days=700)).strftime("%Y-%m-%d")
     hsi = yf.Ticker("^HSI").history(start=start_str, auto_adjust=True)
     hsi.index = pd.to_datetime(hsi.index).tz_localize(None)
-    
+
     # 若指數本身成交量缺失，則備用 2800.HK 真實成交量作為大市活躍度指標
     t2800 = yf.Ticker("2800.HK").history(start=start_str, auto_adjust=True)
     t2800.index = pd.to_datetime(t2800.index).tz_localize(None)
-    
+
     if hsi["Volume"].sum() == 0 or hsi["Volume"].isna().all():
         hsi["Volume"] = t2800["Volume"].reindex(hsi.index).ffill()
 
@@ -102,9 +102,7 @@ def fetch_oneil_market_data():
     window_days = 25
     recent_25 = hsi.iloc[-window_days:].copy()
     dd_records = []
-    
-    curr_close = hsi["Close"].iloc[-1]
-    
+
     for dt, row in recent_25.iterrows():
         if row["Is_DD"]:
             dd_price = row["Close"]
@@ -112,11 +110,11 @@ def fetch_oneil_market_data():
             # 檢查之後的收市價有無高於該日 5%
             max_after = hsi.loc[dt:, "Close"].max()
             erased_by_gain = max_after >= dd_price * 1.05
-            
+
             status = "🚨 有效（壓制大市）"
             if erased_by_gain:
                 status = "✅ 已消化（指數升穿 >5%）"
-                
+
             dd_records.append({
                 "日期": dt.strftime("%Y-%m-%d"),
                 "距今交易日": f"{days_ago} 日前",
@@ -133,7 +131,6 @@ def fetch_oneil_market_data():
     # 邏輯：跌浪過後首個向上日為 Day 1，隨後 Day 4-15 內出現單日大升 >= 1.2% 且 放量
     ftd_records = []
     for i in range(50, len(hsi)):
-        # 尋找前期跌勢 (低於 20 日低位)
         sub = hsi.iloc[i-30:i+1]
         c_today = sub["Close"].iloc[-1]
         c_prev = sub["Close"].iloc[-2]
@@ -156,7 +153,8 @@ def fetch_oneil_market_data():
 
     return hsi, dd_records, active_dd_count, ftd_records
 
-# 3. 千億 VCP 雷達數據下載
+
+# 3. 千億 VCP 雷達數據下載（含近 5 日已突破追蹤）
 @st.cache_data(ttl=3600)
 def fetch_vcp_data():
     start_str = (datetime.now() - timedelta(days=500)).strftime("%Y-%m-%d")
@@ -168,7 +166,19 @@ def fetch_vcp_data():
     raw = yf.download(tickers, start=start_str, group_by="ticker", auto_adjust=True, progress=False, threads=True)
 
     breakout_list = []
+    recent_breakouts = []
     watchlist = []
+
+    def check_vcp_flags(row):
+        c_val = row["Close"]
+        is_s2 = (
+            (c_val > row["MA50"]) and (row["MA50"] > row["MA150"]) and
+            (row["MA150"] > row["MA200"]) and (row["MA200"] > row["MA200_20d_ago"]) and
+            (c_val >= row["High_252"] * 0.75)
+        )
+        is_t = (row["Range_10"] < 0.15) and (row["Range_10"] < row["Range_50"] * 0.70)
+        is_bo = (c_val > row["High_20_Prev"]) and (row["Volume"] > row["Vol_MA50"] * 1.3)
+        return is_s2, is_t, is_bo
 
     for tk, name in HK_STOCKS_DICT.items():
         try:
@@ -186,6 +196,7 @@ def fetch_vcp_data():
             d["MA50"] = d["Close"].rolling(50).mean()
             d["MA150"] = d["Close"].rolling(150).mean()
             d["MA200"] = d["Close"].rolling(200).mean()
+            d["MA200_20d_ago"] = d["MA200"].shift(20)
             d["High_252"] = d["High"].rolling(252).max()
             d["High_20_Prev"] = d["High"].rolling(20).max().shift(1)
             d["Vol_MA50"] = d["Volume"].rolling(50).mean()
@@ -196,60 +207,90 @@ def fetch_vcp_data():
             latest = d.iloc[-1]
             c = latest["Close"]
             ma50 = latest["MA50"]
-            ma150 = latest["MA150"]
-            ma200 = latest["MA200"]
-            ma200_20d_ago = d["MA200"].iloc[-21] if len(d) >= 221 else ma200
-            high_252 = latest["High_252"]
             high_20_prev = latest["High_20_Prev"]
             vol = latest["Volume"]
             vol_ma50 = latest["Vol_MA50"]
             range_10 = latest["Range_10"]
-            range_50 = latest["Range_50"]
             rs_60 = (c / d["Close"].iloc[-61] - 1) * 100 if len(d) >= 61 else 0.0
-
-            is_stage2 = (
-                (c > ma50) and (ma50 > ma150) and (ma150 > ma200) and
-                (ma200 > ma200_20d_ago) and (c >= high_252 * 0.75)
-            )
-            is_tight = (range_10 < 0.15) and (range_10 < range_50 * 0.70)
-            is_breakout = (c > high_20_prev) and (vol > vol_ma50 * 1.3)
-
             vol_ratio = (vol / vol_ma50) if vol_ma50 > 0 else 0.0
-            stop_loss = c * 0.93
 
-            if is_stage2 and is_tight:
-                if is_breakout:
-                    breakout_list.append({
-                        "代號": tk,
-                        "股票名稱": name,
-                        "最新收市價": f"${c:.2f}",
-                        "建議 -7% 止蝕價": f"${stop_loss:.2f}",
-                        "50MA 離場防線": f"${ma50:.2f}",
-                        "突破幅度": f"+{((c - high_20_prev) / high_20_prev) * 100:.1f}%",
-                        "成交量爆發": f"{vol_ratio:.1f}x 均量",
-                        "60日相對強度 (RS)": f"{rs_60:+.1f}%",
-                        "rs_val": rs_60
-                    })
-                elif c <= high_20_prev:
-                    dist_to_breakout = ((high_20_prev - c) / c) * 100
-                    watchlist.append({
-                        "代號": tk,
-                        "股票名稱": name,
-                        "最新現價": f"${c:.2f}",
-                        "突破目標價 (前高)": f"${high_20_prev:.2f}",
-                        "距離突破仲差": f"{dist_to_breakout:.1f}%",
-                        "近10日波幅 (收縮度)": f"{range_10 * 100:.1f}%",
-                        "50MA 基準": f"${ma50:.2f}",
-                        "今日量比": f"{vol_ratio:.2f}x 均量",
-                        "60日相對強度 (RS)": f"{rs_60:+.1f}%",
-                        "dist_val": dist_to_breakout
-                    })
+            # 先檢查過去 1 至 5 個交易日內是否已經突破（由舊到新搵出首日突破點）
+            recent_bo = None
+            for idx_dt, hist_row in d.iloc[-6:-1].iterrows():
+                h_s2, h_tight, h_bo = check_vcp_flags(hist_row)
+                if h_s2 and h_tight and h_bo:
+                    recent_bo = (idx_dt, hist_row)
+                    break
+
+            is_stage2, is_tight, is_breakout = check_vcp_flags(latest)
+
+            # 1. 近 5 日已突破追蹤名單（已突破股鎖定喺呢度，唔會再跌入準備名單）
+            if recent_bo is not None:
+                bo_dt, bo_row = recent_bo
+                bo_price = bo_row["Close"]
+                bo_stop_loss = bo_price * 0.93
+                diff_from_bo = ((c - bo_price) / bo_price) * 100
+
+                if c < bo_stop_loss:
+                    bo_status = "❌ 觸發 -7% 止蝕"
+                elif c < ma50:
+                    bo_status = "⚠️ 跌穿 50MA"
+                elif diff_from_bo <= 5.0:
+                    bo_status = "🟢 5% 可追區內"
+                else:
+                    bo_status = "🚀 已拉開 (勿高追)"
+
+                recent_breakouts.append({
+                    "代號": tk,
+                    "股票名稱": name,
+                    "突破日期": bo_dt.strftime("%Y-%m-%d"),
+                    "突破價 (當日收市)": f"${bo_price:.2f}",
+                    "最新現價": f"${c:.2f}",
+                    "距突破價幅度": f"{diff_from_bo:+.1f}%",
+                    "原定 -7% 止蝕價": f"${bo_stop_loss:.2f}",
+                    "50MA 防線": f"${ma50:.2f}",
+                    "追蹤狀態": bo_status,
+                    "bo_dt_sort": bo_dt
+                })
+
+            # 2. 今日最新放量突破
+            elif is_stage2 and is_tight and is_breakout:
+                stop_loss = c * 0.93
+                breakout_list.append({
+                    "代號": tk,
+                    "股票名稱": name,
+                    "最新收市價": f"${c:.2f}",
+                    "建議 -7% 止蝕價": f"${stop_loss:.2f}",
+                    "50MA 離場防線": f"${ma50:.2f}",
+                    "突破幅度": f"+{((c - high_20_prev) / high_20_prev) * 100:.1f}%",
+                    "成交量爆發": f"{vol_ratio:.1f}x 均量",
+                    "60日相對強度 (RS)": f"{rs_60:+.1f}%",
+                    "rs_val": rs_60
+                })
+
+            # 3. 形態收縮就緒（嚴格排除今日及近 5 日已突破股）
+            elif is_stage2 and is_tight and c <= high_20_prev:
+                dist_to_breakout = ((high_20_prev - c) / c) * 100
+                watchlist.append({
+                    "代號": tk,
+                    "股票名稱": name,
+                    "最新現價": f"${c:.2f}",
+                    "突破目標價 (前高)": f"${high_20_prev:.2f}",
+                    "距離突破仲差": f"{dist_to_breakout:.1f}%",
+                    "近10日波幅 (收縮度)": f"{range_10 * 100:.1f}%",
+                    "50MA 基準": f"${ma50:.2f}",
+                    "今日量比": f"{vol_ratio:.2f}x 均量",
+                    "60日相對強度 (RS)": f"{rs_60:+.1f}%",
+                    "dist_val": dist_to_breakout
+                })
         except Exception:
             continue
 
     breakout_list.sort(key=lambda x: x["rs_val"], reverse=True)
+    recent_breakouts.sort(key=lambda x: x["bo_dt_sort"], reverse=True)
     watchlist.sort(key=lambda x: x["dist_val"])
-    return hsi, breakout_list, watchlist
+    return hsi, breakout_list, recent_breakouts, watchlist
+
 
 # 標題與更新掣
 col_title, col_btn = st.columns([4, 1])
@@ -488,7 +529,7 @@ with tab3:
 # ================= 頁面 4：千億港股 VCP 突破雷達 =================
 with tab4:
     with st.spinner("正在掃描 82 隻千億市值港股並運算 VCP 形態（約需 10–15 秒）..."):
-        hsi, breakouts, watch_list = fetch_vcp_data()
+        hsi, breakouts, recent_breakouts, watch_list = fetch_vcp_data()
 
     latest_hsi = hsi.iloc[-1]
     hsi_close = latest_hsi["Close"]
@@ -510,21 +551,33 @@ with tab4:
 
     st.divider()
 
-    # 1. 今日放量突破
-    st.subheader(f"🎯 今日放量突破股票（共 {len(breakouts)} 隻）")
-    st.caption("符合條件：Minervini 第二階段趨勢 ＋ VCP 波幅收縮完成 ＋ 今日收市價突破過去 20 日高位 ＋ 成交量 > 1.3 倍 50 日均量。")
+    # 1. 今日最新放量突破
+    st.subheader(f"🎯 今日最新放量突破（共 {len(breakouts)} 隻）")
+    st.caption("符合條件：Minervini 第二階段趨勢 ＋ VCP 波幅收縮完成 ＋ 今日首次突破過去 20 日高位 ＋ 成交量 > 1.3 倍 50 日均量。")
 
     if breakouts:
         b_df = pd.DataFrame(breakouts).drop(columns=["rs_val"])
         st.dataframe(b_df, use_container_width=True, hide_index=True)
     else:
-        st.info("今日暫無千億市值股票觸發「放量突破」買入訊號。")
+        st.info("今日暫無千億市值股票觸發全新「放量突破」買入訊號。")
 
     st.divider()
 
-    # 2. 形態收縮就緒（觀察名單）
+    # 2. 近 5 日已突破追蹤名單
+    st.subheader(f"🔥 近 5 個交易日已突破追蹤（共 {len(recent_breakouts)} 隻）")
+    st.caption("過去 1–5 個交易日內曾觸發 VCP 放量突破之股票，按突破日期由近至遠排序（已自動從下方準備名單移除）。")
+
+    if recent_breakouts:
+        r_df = pd.DataFrame(recent_breakouts).drop(columns=["bo_dt_sort"])
+        st.dataframe(r_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("過去 5 個交易日暫無已突破股票記錄。")
+
+    st.divider()
+
+    # 3. 形態收縮就緒（觀察名單）
     st.subheader(f"👀 形態收縮就緒・即將突破觀察名單（共 {len(watch_list)} 隻）")
-    st.caption("符合條件：第二階段趨勢向上 ＋ 近 10 日波幅收縮至 15% 內且乾量洗盤完成，但尚未突破前高。按「距離突破差幅」由近至遠排序。")
+    st.caption("符合條件：第二階段趨勢向上 ＋ 近 10 日波幅收縮至 15% 內，且近 5 日未曾突破前高。按「距離突破差幅」由近至遠排序。")
 
     if watch_list:
         w_df = pd.DataFrame(watch_list).drop(columns=["dist_val"])
@@ -534,8 +587,8 @@ with tab4:
 
     with st.expander("📖 實戰操作與風控紀律說明（50MA 止賺 ＋ -7% 硬止蝕）"):
         st.markdown("""
-        * **1. 大市綠燈才開倉**：只有當上方恒指呈現 **🟢 綠燈**（或 O'Neil 分頁處於確認升勢）時，先准按「今日放量突破名單」買入，最多同時持有 5 隻（每隻注碼 20%）。
+        * **1. 大市綠燈才開倉**：只有當上方恒指呈現 **🟢 綠燈**（或 O'Neil 分頁處於確認升勢）時，先准按「今日最新放量突破」或「近 5 日追蹤名單內 5% 可追區」買入，最多同時持有 5 隻（每隻注碼 20%）。
         * **2. 觀察名單點樣用？**：睇實「距離突破仲差」低於 3% 嗰幾隻。翌日盤中如果見股價衝破「突破目標價」，且下午成交量明顯放大，尾市（15:55）即可準備入場。
-        * **3. 買入即掛 `-7%` 硬止蝕**：按表格提供的「建議 -7% 止蝕價」喺券商掛條件單，盤中掂到無條件即走，保命第一。
+        * **3. 買入即掛 `-7%` 硬止蝕**：按表格提供的「-7% 止蝕價」喺券商掛條件單，盤中掂到無條件即走，保命第一。
         * **4. 50MA 移動止賺離場**：每日下午 4:00 收市檢視，若**收市價正式跌穿 50MA**，翌日開市離場鎖定利潤；未跌穿則安心持貨食盡大浪。
         """)
