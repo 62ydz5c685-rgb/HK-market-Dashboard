@@ -154,7 +154,7 @@ def fetch_oneil_market_data():
     return hsi, dd_records, active_dd_count, ftd_records
 
 
-# 3. 千億 VCP 雷達數據下載（含近 5 日已突破追蹤）
+# 3. 千億 VCP 雷達數據下載（含近 5 日已突破追蹤 + 活躍股 50MA 市寬）
 @st.cache_data(ttl=3600)
 def fetch_vcp_data():
     start_str = (datetime.now() - timedelta(days=500)).strftime("%Y-%m-%d")
@@ -168,6 +168,8 @@ def fetch_vcp_data():
     breakout_list = []
     recent_breakouts = []
     watchlist = []
+    above_50ma_count = 0
+    total_valid_stocks = 0
 
     def check_vcp_flags(row):
         c_val = row["Close"]
@@ -207,6 +209,13 @@ def fetch_vcp_data():
             latest = d.iloc[-1]
             c = latest["Close"]
             ma50 = latest["MA50"]
+
+            # 統計千億股池 50MA 市寬
+            if pd.notna(c) and pd.notna(ma50):
+                total_valid_stocks += 1
+                if c > ma50:
+                    above_50ma_count += 1
+
             high_20_prev = latest["High_20_Prev"]
             vol = latest["Volume"]
             vol_ma50 = latest["Vol_MA50"]
@@ -289,7 +298,7 @@ def fetch_vcp_data():
     breakout_list.sort(key=lambda x: x["rs_val"], reverse=True)
     recent_breakouts.sort(key=lambda x: x["bo_dt_sort"], reverse=True)
     watchlist.sort(key=lambda x: x["dist_val"])
-    return hsi, breakout_list, recent_breakouts, watchlist
+    return hsi, breakout_list, recent_breakouts, watchlist, above_50ma_count, total_valid_stocks
 
 
 # 標題與更新掣
@@ -528,25 +537,50 @@ with tab3:
 
 # ================= 頁面 4：千億港股 VCP 突破雷達 =================
 with tab4:
-    with st.spinner("正在掃描 82 隻千億市值港股並運算 VCP 形態（約需 10–15 秒）..."):
-        hsi, breakouts, recent_breakouts, watch_list = fetch_vcp_data()
+    with st.spinner(f"正在掃描 {len(HK_STOCKS_DICT)} 隻千億市值港股並運算 VCP 形態與市寬（約需 10–15 秒）..."):
+        hsi, breakouts, recent_breakouts, watch_list, above_50ma_count, total_valid_stocks = fetch_vcp_data()
 
     latest_hsi = hsi.iloc[-1]
     hsi_close = latest_hsi["Close"]
     hsi_ma50 = latest_hsi["MA50"]
     hsi_diff_pct = ((hsi_close - hsi_ma50) / hsi_ma50) * 100
-    mkt_is_green = hsi_close > hsi_ma50
+    breadth_pct = (above_50ma_count / total_valid_stocks * 100) if total_valid_stocks > 0 else 0.0
 
-    st.subheader("🚦 恒生指數 50MA 大市濾網狀態")
+    mkt_is_green = hsi_close > hsi_ma50
+    mkt_is_yellow = (not mkt_is_green) and (breadth_pct >= 40.0)
+
+    st.subheader("🚦 大市三色濾網（恒指 50MA ＋ 千億股池市寬）")
+
+    b1, b2 = st.columns(2)
+    b1.metric(
+        label="恒生指數 vs 50天線",
+        value=f"{hsi_close:,.0f} 點",
+        delta=f"{hsi_diff_pct:+.2f}% (50MA: {hsi_ma50:,.0f})"
+    )
+    b2.metric(
+        label=f"千億股池 50MA 市寬 ({above_50ma_count}/{total_valid_stocks})",
+        value=f"{breadth_pct:.1f}%",
+        delta="達標 (≥40%)" if breadth_pct >= 40.0 else "偏弱 (<40%)",
+        delta_color="normal" if breadth_pct >= 40.0 else "inverse"
+    )
+
     if mkt_is_green:
         st.success(
-            f"### 🟢 大市綠燈（環境良好，允許追突破開新倉）\n"
-            f"恒指最新收市：**{hsi_close:.0f} 點** ｜ 50天線：**{hsi_ma50:.0f} 點**（企穩均線上方 **+{hsi_diff_pct:.2f}%**）"
+            f"### 🟢 大市綠燈（全速進攻｜100% 正常注碼）\n"
+            f"恒指企穩 50 天線上方（**+{hsi_diff_pct:.2f}%**），股池市寬報 **{breadth_pct:.1f}%**。"
+            f"允許按正常注碼（每隻 20%）追突破開新倉，配合 -7% 硬止蝕及 50MA 移動止賺。"
+        )
+    elif mkt_is_yellow:
+        st.warning(
+            f"### 🟡 大市黃燈（市寬領先｜50% 半注試探）\n"
+            f"恒指仍低於 50 天線（**{hsi_diff_pct:.2f}%**），但千億股池 50MA 市寬已搶先企上 **{breadth_pct:.1f}%（≥40%）**。"
+            f"建議 **注碼減半（每隻 10%）** 只做最強龍頭，並於阻力位適度分批鎖定利潤。"
         )
     else:
         st.error(
-            f"### 🔴 大市紅燈（大市走弱，嚴格禁止追突破開新倉）\n"
-            f"恒指最新收市：**{hsi_close:.0f} 點** ｜ 50天線：**{hsi_ma50:.0f} 點**（跌穿均線 **{hsi_diff_pct:.2f}%**）。已持倉股票請嚴格跟足 50MA 或 -7% 防線執行離場。"
+            f"### 🔴 大市紅燈（大市弱勢｜0% 禁止新開倉）\n"
+            f"恒指跌穿 50 天線（**{hsi_diff_pct:.2f}%**）且千億股池市寬僅 **{breadth_pct:.1f}%（<40%）**。"
+            f"假突破風險極高，嚴格禁止開新倉；已持倉股票請嚴守 50MA 或 -7% 防線離場。"
         )
 
     st.divider()
@@ -585,9 +619,12 @@ with tab4:
     else:
         st.info("今日暫無千億股票處於「VCP 收縮就緒」狀態。")
 
-    with st.expander("📖 實戰操作與風控紀律說明（50MA 止賺 ＋ -7% 硬止蝕）"):
+    with st.expander("📖 實戰操作與風控紀律說明（三色燈號 ＋ 50MA 止賺 ＋ -7% 硬止蝕）"):
         st.markdown("""
-        * **1. 大市綠燈才開倉**：只有當上方恒指呈現 **🟢 綠燈**（或 O'Neil 分頁處於確認升勢）時，先准按「今日最新放量突破」或「近 5 日追蹤名單內 5% 可追區」買入，最多同時持有 5 隻（每隻注碼 20%）。
+        * **1. 三色燈號控倉**：
+          * **🟢 綠燈（恒指 > 50MA）**：100% 正常注碼（每隻 20%，最多同時持有 5 隻），坐足整段主升浪。
+          * **🟡 黃燈（恒指 ≤ 50MA 但股池市寬 ≥ 40%）**：50% 半注試探（每隻 10%），只做 RS 最強龍頭，見好適度分批食糊。
+          * **🔴 紅燈（恒指 ≤ 50MA 且市寬 < 40%）**：0% 全面休戰，唔開新突破倉。
         * **2. 觀察名單點樣用？**：睇實「距離突破仲差」低於 3% 嗰幾隻。翌日盤中如果見股價衝破「突破目標價」，且下午成交量明顯放大，尾市（15:55）即可準備入場。
         * **3. 買入即掛 `-7%` 硬止蝕**：按表格提供的「-7% 止蝕價」喺券商掛條件單，盤中掂到無條件即走，保命第一。
         * **4. 50MA 移動止賺離場**：每日下午 4:00 收市檢視，若**收市價正式跌穿 50MA**，翌日開市離場鎖定利潤；未跌穿則安心持貨食盡大浪。
